@@ -16,7 +16,7 @@ from astrbot.api.all import *
 logger = logging.getLogger(__name__)
 
 
-@register("poke_monitor", "长安某", "监控戳一戳事件插件", "2.0.0")
+@register("poke_monitor", "长安某", "监控戳一戳事件插件", "2.1.0")
 class PokeMonitorPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -254,6 +254,7 @@ class PokeMonitorPlugin(Star):
             except Exception as e:
                 logger.error(f"表情包请求失败: {str(e)}")
 
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @event_message_type(filter.EventMessageType.ALL)
     async def on_group_message(self, event: AstrMessageEvent):
         raw_message = event.message_obj.raw_message
