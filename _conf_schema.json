@@ -1,4 +1,44 @@
 {
+  "blacklist_settings": {
+    "description": "群聊黑名单设置 (优先级高于白名单)",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "是否启用黑名单模式",
+        "type": "bool",
+        "hint": "开启后，下方列表中的群聊将完全屏蔽戳一戳插件的功能。",
+        "default": false
+      },
+      "blocked_groups": {
+        "description": "屏蔽的群号列表",
+        "type": "list",
+        "items": {
+          "type": "int"
+        },
+        "default": []
+      }
+    }
+  },
+  "whitelist_settings": {
+    "description": "群聊白名单设置",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "是否启用白名单模式",
+        "type": "bool",
+        "hint": "开启后，只有在下方列表中的群聊才会触发戳一戳的所有功能 (若该群同时在黑名单中则会被屏蔽)。",
+        "default": false
+      },
+      "allowed_groups": {
+        "description": "允许的群号列表",
+        "type": "list",
+        "items": {
+          "type": "int"
+        },
+        "default": []
+      }
+    }
+  },
   "feature_switches": {
     "description": "各项主要功能的开关",
     "type": "object",
