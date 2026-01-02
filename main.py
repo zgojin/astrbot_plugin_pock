@@ -16,7 +16,7 @@ from astrbot.api.all import *
 logger = logging.getLogger(__name__)
 
 
-@register("poke_monitor", "长安某", "监控戳一戳事件插件", "2.0.0")
+@register("poke_monitor", "长安某", "监控戳一戳事件插件", "2.1.0")
 class PokeMonitorPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -70,6 +70,34 @@ class PokeMonitorPlugin(Star):
                         os.unlink(file_path)
                 except Exception as e:
                     logger.error(f"表情包文件清理失败: {str(e)}")
+
+    # 黑白名单逻辑
+    def _is_group_allowed(self, group_id: int) -> bool:
+        """
+        检查群组权限。
+        优先级: 黑名单 > 白名单
+        """
+        g_id = int(group_id)
+
+        # 1. 检查黑名单
+        blacklist_settings = self.config.get("blacklist_settings", {})
+        if blacklist_settings.get("enabled", False):
+            blocked_groups = [int(x) for x in blacklist_settings.get("blocked_groups", [])]
+            if g_id in blocked_groups:
+                # 在黑名单中，直接拒绝
+                return False
+
+        # 2. 检查白名单
+        whitelist_settings = self.config.get("whitelist_settings", {})
+        if whitelist_settings.get("enabled", False):
+            allowed_groups = [int(x) for x in whitelist_settings.get("allowed_groups", [])]
+            if g_id not in allowed_groups:
+                # 开启了白名单，但不在列表里，拒绝
+                return False
+        
+        # 3. 默认允许
+        return True
+    # --------------------------------------------------------
 
     # 分群计数
     def _record_group_poke(self, group_id: int) -> int:
@@ -267,7 +295,8 @@ class PokeMonitorPlugin(Star):
         group_id = raw_message.get("group_id")
         if not group_id:
             return
-
+        if not self._is_group_allowed(group_id):
+            return
         bot_id = raw_message.get("self_id")
         sender_id = raw_message.get("user_id")
         target_id = raw_message.get("target_id")
