@@ -1,32 +1,35 @@
 import asyncio
 import json
-import logging
 import os
 import random
-import shutil
 import time
+import uuid
+import shutil
+from pathlib import Path
 
 import aiofiles
 import aiohttp
-from scrapy import Selector
 
 import astrbot.api.event.filter as filter
 from astrbot.api.all import *
+from astrbot.api import logger
 
-logger = logging.getLogger(__name__)
-
-
-@register("poke_monitor", "长安某", "监控戳一戳事件插件", "2.1.0")
+@register("poke_monitor", "长安某", "监控戳一戳事件插件", "2.1.1")
 class PokeMonitorPlugin(Star):
-    def __init__(self, context: Context, config: dict):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+        
         self.group_poke_timestamps = {}
         self.group_cooldown_end_time = {}
         self.emoji_last_used_time = 0
         self.emoji_lock = asyncio.Lock()
         self.llm_lock = asyncio.Lock()
-
-        self.config = config
+        self.data_dir = Path("data") / "plugin_data" / "poke_monitor"
+        self.temp_image_dir = self.data_dir / "temp_images"
+        
+        # 确保目录存在
+        self.temp_image_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             emoji_settings = self.config.get("emoji_settings", {})
@@ -37,45 +40,45 @@ class PokeMonitorPlugin(Star):
             logger.error(f"解析 emoji_url_mapping 配置失败: {e}，将使用空字典。")
             self.emoji_url_mapping = {}
 
+        # 初始化时清理旧的临时文件
+        self._clean_temp_directory()
+        # 清理旧版本的遗留目录（可选保留）
         self._clean_legacy_directories()
-        self._clean_emoji_directory()
 
         self.func_tools_mgr = context.get_llm_tool_manager()
         self.conversation_manager = context.conversation_manager
 
     def _clean_legacy_directories(self):
+        """清理旧版本插件可能产生的遗留目录"""
         legacy_dirs = [
-            os.path.abspath(d)
-            for d in [
-                "./data/plugins/poke_monitor",
-                "./data/plugins/plugins/poke_monitor",
-            ]
+            Path("./data/plugins/poke_monitor"),
+            Path("./data/plugins/plugins/poke_monitor"),
+            Path("./data/plugins/astrbot_plugin_pock/poke_monitor")
         ]
         for path in legacy_dirs:
             try:
-                if os.path.exists(path):
+                if path.exists():
                     shutil.rmtree(path)
+                    logger.info(f"清理旧目录成功: {path}")
             except Exception as e:
-                logger.error(f"旧目录清理失败: {str(e)}")
+                # 旧目录不存在或清理失败不影响运行，仅记录 debug
+                logger.debug(f"旧目录清理跳过: {str(e)}")
 
-    def _clean_emoji_directory(self):
-        save_dir = os.path.join(
-            "data", "plugins", "astrbot_plugin_pock", "poke_monitor"
-        )
-        if os.path.exists(save_dir):
-            for filename in os.listdir(save_dir):
-                file_path = os.path.join(save_dir, filename)
-                try:
-                    if os.path.isfile(file_path):
-                        os.unlink(file_path)
-                except Exception as e:
-                    logger.error(f"表情包文件清理失败: {str(e)}")
+    def _clean_temp_directory(self):
+        """清理当前插件的临时图片目录"""
+        try:
+            if self.temp_image_dir.exists():
+                for file_path in self.temp_image_dir.iterdir():
+                    if file_path.is_file():
+                        file_path.unlink()  # 删除文件
+        except Exception as e:
+            logger.error(f"清理临时目录失败: {str(e)}")
 
-    # 黑白名单逻辑
+    # === 黑白名单逻辑 ===
     def _is_group_allowed(self, group_id: int) -> bool:
         """
         检查群组权限。
-        优先级: 黑名单 > 白名单
+        优先级: 黑名单 > 白名单 > 默认允许
         """
         g_id = int(group_id)
 
@@ -84,7 +87,6 @@ class PokeMonitorPlugin(Star):
         if blacklist_settings.get("enabled", False):
             blocked_groups = [int(x) for x in blacklist_settings.get("blocked_groups", [])]
             if g_id in blocked_groups:
-                # 在黑名单中，直接拒绝
                 return False
 
         # 2. 检查白名单
@@ -92,42 +94,30 @@ class PokeMonitorPlugin(Star):
         if whitelist_settings.get("enabled", False):
             allowed_groups = [int(x) for x in whitelist_settings.get("allowed_groups", [])]
             if g_id not in allowed_groups:
-                # 开启了白名单，但不在列表里，拒绝
                 return False
         
         # 3. 默认允许
         return True
-    # --------------------------------------------------------
 
-    # 分群计数
+    # === 分群计数 ===
     def _record_group_poke(self, group_id: int) -> int:
         """记录指定群聊的戳一戳行为，并返回该群在2分钟内的被戳次数"""
         now = time.time()
         two_minutes_ago = now - 120
 
-        # 获取该群的时间戳列表，如果不存在则创建一个空列表
         timestamps = self.group_poke_timestamps.get(group_id, [])
-
         # 清理2分钟前的记录
         valid_timestamps = [t for t in timestamps if t > two_minutes_ago]
-
-        # 添加记录
+        # 添加当前记录
         valid_timestamps.append(now)
 
-        # 更新字典
         self.group_poke_timestamps[group_id] = valid_timestamps
-
-        # 返回当前群的计数
         return len(valid_timestamps)
 
     async def _get_user_display_name(
         self, event: AstrMessageEvent, group_id: int, user_id: int
     ) -> str:
-        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
-            AiocqhttpMessageEvent,
-        )
-
-        assert isinstance(event, AiocqhttpMessageEvent)
+        # 获取用户昵称
         client = event.bot
         try:
             payloads = {"group_id": group_id, "user_id": user_id, "no_cache": True}
@@ -147,6 +137,7 @@ class PokeMonitorPlugin(Star):
             return f"某位群友({user_id})"
 
     async def _get_llm_response(self, poke_count, event, user_nickname=""):
+        # 获取 LLM 回复
         curr_cid = await self.conversation_manager.get_curr_conversation_id(
             event.unified_msg_origin
         )
@@ -211,6 +202,7 @@ class PokeMonitorPlugin(Star):
         self.group_cooldown_end_time[group_id] = time.time() + 300
 
     async def _handle_poke_back(self, event, sender_id: int, group_id: int):
+        """处理反击（回戳）逻辑"""
         feature_switches = self.config.get("feature_switches", {})
         if not feature_switches.get("poke_back_enabled", True):
             return
@@ -233,6 +225,7 @@ class PokeMonitorPlugin(Star):
                     break
 
     async def _handle_emoji(self, event, target_id: int):
+        """处理表情包生成逻辑"""
         feature_switches = self.config.get("feature_switches", {})
         if not feature_switches.get("emoji_trigger_enabled", True):
             return
@@ -264,19 +257,19 @@ class PokeMonitorPlugin(Star):
                     ) as response:
                         if response.status == 200:
                             content = await response.read()
-                            save_dir = os.path.join(
-                                "data", "plugins", "astrbot_plugin_pock", "poke_monitor"
-                            )
-                            os.makedirs(save_dir, exist_ok=True)
-                            filename = (
-                                f"{selected_action}_{target_id}_{int(time.time())}.gif"
-                            )
-                            image_path = os.path.join(save_dir, filename)
+                            
+                            # 使用 UUID 生成唯一文件名，防止冲突
+                            filename = f"{selected_action}_{target_id}_{uuid.uuid4().hex}.gif"
+                            image_path = self.temp_image_dir / filename
+                            
                             async with aiofiles.open(image_path, "wb") as f:
                                 await f.write(content)
-                            yield event.image_result(image_path)
+                            yield event.image_result(str(image_path))
+                            
+                            # 发送后尝试清理
                             try:
-                                os.remove(image_path)
+                                if image_path.exists():
+                                    image_path.unlink()
                             except Exception as e:
                                 logger.error(f"表情包临时文件清理失败: {str(e)}")
             except Exception as e:
@@ -284,7 +277,13 @@ class PokeMonitorPlugin(Star):
 
     @event_message_type(filter.EventMessageType.ALL)
     async def on_group_message(self, event: AstrMessageEvent):
+        # raw_message 可能为 None,也可能不是 dict
+        # 跳过
         raw_message = event.message_obj.raw_message
+        if not raw_message or not isinstance(raw_message, dict):
+            return
+
+        # 检查是否为 poke 消息
         if not (
             raw_message.get("post_type") == "notice"
             and raw_message.get("notice_type") == "notify"
@@ -295,14 +294,19 @@ class PokeMonitorPlugin(Star):
         group_id = raw_message.get("group_id")
         if not group_id:
             return
+        
+        # 检查权限
         if not self._is_group_allowed(group_id):
             return
+        
         bot_id = raw_message.get("self_id")
         sender_id = raw_message.get("user_id")
         target_id = raw_message.get("target_id")
+        
         if not (bot_id and sender_id and target_id):
             return
 
+        # 自己(Bot)被戳
         if str(target_id) == str(bot_id):
             user_display_name = await self._get_user_display_name(
                 event, group_id, sender_id
@@ -316,6 +320,7 @@ class PokeMonitorPlugin(Star):
                     self._set_cooldown(group_id)
 
                 feature_switches = self.config.get("feature_switches", {})
+                # 检查是否在回复冷却中
                 if feature_switches.get(
                     "poke_response_enabled", True
                 ) and self._should_reply_text(group_id):
@@ -324,9 +329,11 @@ class PokeMonitorPlugin(Star):
                     )
                     yield event.plain_result(response)
 
+            # 触发回戳
             async for result in self._handle_poke_back(event, sender_id, group_id):
                 yield result
 
+        # 群友互戳
         elif str(sender_id) != str(bot_id):
             async for result in self._handle_emoji(event, target_id):
                 yield result
